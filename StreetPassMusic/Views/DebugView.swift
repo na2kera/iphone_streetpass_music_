@@ -3,13 +3,21 @@ import SwiftUI
 
 struct DebugView: View {
     @Environment(PassbyManager.self) private var manager
-    @Query(sort: \DebugEvent.timestamp, order: .reverse) private var events: [DebugEvent]
+    @Environment(\.modelContext) private var modelContext
+    /// 表示用。新しい順に最大 300 件だけ取得する（書き出しはボタン押下時に全件を取得する）
+    @Query(DebugView.recentEventsDescriptor) private var events: [DebugEvent]
     @Query(sort: \PassbyEvent.receivedAt, order: .reverse) private var history: [PassbyEvent]
 
     @State private var debugExportURL: URL?
     @State private var historyExportURL: URL?
     @State private var exportError: String?
     @State private var showClearConfirm = false
+
+    private static let recentEventsDescriptor: FetchDescriptor<DebugEvent> = {
+        var descriptor = FetchDescriptor<DebugEvent>(sortBy: [SortDescriptor(\DebugEvent.timestamp, order: .reverse)])
+        descriptor.fetchLimit = 300
+        return descriptor
+    }()
 
     private let counterTypes: [EventLogger.EventType] = [.discovered, .connect, .read, .write, .save, .cooldown, .restore, .error]
 
@@ -28,7 +36,7 @@ struct DebugView: View {
                 }
 
                 Section("実験設定") {
-                    Toggle("発見のみ（接続・交換しない）", isOn: Binding(
+                    Toggle("発見のみ（接続せず、GATT 応答も拒否）", isOn: Binding(
                         get: { manager.discoveryOnly },
                         set: { manager.setDiscoveryOnly($0) }
                     ))
@@ -60,8 +68,8 @@ struct DebugView: View {
                 }
 
                 Section("エクスポート") {
-                    Button("デバッグログを書き出す（\(events.count) 件）") {
-                        debugExportURL = export { try LogExporter.exportDebugEvents(events.reversed()) }
+                    Button("デバッグログを書き出す（\(debugEventCount) 件）") {
+                        debugExportURL = export { try LogExporter.exportDebugEvents(fetchAllDebugEvents()) }
                     }
                     if let url = debugExportURL {
                         ShareLink(item: url) { Label("デバッグログを共有", systemImage: "square.and.arrow.up") }
@@ -85,7 +93,7 @@ struct DebugView: View {
                 }
 
                 Section("ログ（新しい順・最大 300 件）") {
-                    ForEach(events.prefix(300)) { event in
+                    ForEach(events) { event in
                         VStack(alignment: .leading, spacing: 2) {
                             HStack {
                                 Text(event.timestamp.formatted(.dateTime.hour().minute().second().secondFraction(.fractional(3))))
@@ -114,6 +122,16 @@ struct DebugView: View {
         case (false, true): return "peripheral"
         default: return "なし"
         }
+    }
+
+    /// 件数表示用（@Query は 300 件に制限しているため別途数える）
+    private var debugEventCount: Int {
+        (try? modelContext.fetchCount(FetchDescriptor<DebugEvent>())) ?? events.count
+    }
+
+    /// 書き出し用に全件を古い順で取得する
+    private func fetchAllDebugEvents() throws -> [DebugEvent] {
+        try modelContext.fetch(FetchDescriptor<DebugEvent>(sortBy: [SortDescriptor(\DebugEvent.timestamp, order: .forward)]))
     }
 
     private func export(_ make: () throws -> URL) -> URL? {

@@ -10,14 +10,16 @@ settings:
     SWIFT_VERSION: "5.0"
     SWIFT_STRICT_CONCURRENCY: minimal
     CODE_SIGN_STYLE: Automatic
-    # Personal Team を使う場合は Xcode の Signing & Capabilities で一度 Team を選ぶ
-    DEVELOPMENT_TEAM: ""
     MARKETING_VERSION: "0.1.0"
     CURRENT_PROJECT_VERSION: "1"
 targets:
   StreetPassMusic:
     type: application
     platform: iOS
+    # Team ID は git 管理外の Local.xcconfig から読む（Local.xcconfig.example をコピーして作る）
+    configFiles:
+      Debug: Local.xcconfig
+      Release: Local.xcconfig
     sources:
       - path: StreetPassMusic
     info:
@@ -38,4 +40,3 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.keranatsuki.streetpassmusic
         TARGETED_DEVICE_FAMILY: "1"
-        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES

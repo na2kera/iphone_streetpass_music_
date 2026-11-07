@@ -10,6 +10,11 @@ struct SongEditView: View {
     @State private var artist = ""
     @State private var url = ""
     @State private var message: String?
+    @State private var loaded = false
+
+    /// 512 バイトのペイロードに収めやすくするための入力上限（文字数）
+    private let maxTextLength = 100
+    private let maxURLLength = 300
 
     private var trimmedTitle: String { title.trimmingCharacters(in: .whitespacesAndNewlines) }
     private var trimmedArtist: String { artist.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -21,11 +26,14 @@ struct SongEditView: View {
             Form {
                 Section("お気に入りの曲（1曲）") {
                     TextField("曲名", text: $title)
+                        .onChange(of: title) { _, v in if v.count > maxTextLength { title = String(v.prefix(maxTextLength)) } }
                     TextField("アーティスト名", text: $artist)
+                        .onChange(of: artist) { _, v in if v.count > maxTextLength { artist = String(v.prefix(maxTextLength)) } }
                     TextField("URL（任意・https のみ）", text: $url)
                         .keyboardType(.URL)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
+                        .onChange(of: url) { _, v in if v.count > maxURLLength { url = String(v.prefix(maxURLLength)) } }
                     if !urlIsValid {
                         Text("https:// で始まる URL のみ登録できます").font(.footnote).foregroundStyle(.red)
                     }
@@ -43,7 +51,12 @@ struct SongEditView: View {
                 }
             }
             .navigationTitle("曲登録")
-            .onAppear(perform: load)
+            .onAppear {
+                // タブ切り替えのたびに編集中の入力を上書きしないよう、初回のみ読み込む
+                guard !loaded else { return }
+                loaded = true
+                load()
+            }
         }
     }
 

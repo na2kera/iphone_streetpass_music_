@@ -30,6 +30,11 @@ final class PeripheralSession {
 @MainActor
 @Observable
 final class PassbyManager: NSObject {
+    /// GATT サービスの登録状態
+    enum ServiceState {
+        case none, adding, added
+    }
+
     // MARK: 観測可能な状態
     private(set) var centralState: CBManagerState = .unknown
     private(set) var peripheralState: CBManagerState = .unknown
@@ -38,8 +43,10 @@ final class PassbyManager: NSObject {
     private(set) var activeSessionCount = 0
     private(set) var restoredCentralAtLaunch = false
     private(set) var restoredPeripheralAtLaunch = false
-    /// アプリ起動ごとに生成する短命トークン。重複抑制にのみ使う。
-    let sessionToken: String
+    /// 短命トークン。重複抑制にのみ使う。起動時に生成し、60 分ごとに作り直す。
+    private(set) var sessionToken: String
+    private var tokenCreatedAt: Date
+    private let tokenLifetime: TimeInterval = 60 * 60
 
     // MARK: 設定（UserDefaults に永続化）
     private(set) var isEnabled: Bool
@@ -51,24 +58,36 @@ final class PassbyManager: NSObject {
 
     private var central: CBCentralManager?
     private var peripheralManager: CBPeripheralManager?
-    private var serviceAdded = false
+    private var serviceState: ServiceState = .none
 
     // Central 側
     private var sessions: [UUID: PeripheralSession] = [:]
     private var nextAllowedAtByPeripheral: [UUID: Date] = [:]
     /// 失敗時の再試行待ち時間
     private let failureBackoff: TimeInterval = 30
+    /// State Restoration で渡された peripheral。poweredOn になってから処理する。
+    private var restoredPeripherals: [CBPeripheral] = []
+    /// 切断要求を出し、didDisconnect をまだ受けていない peripheral
+    private var disconnecting: [UUID: CBPeripheral] = [:]
+    /// クールダウン／バックオフ中に発見したため接続しなかった peripheral と、その解除時刻
+    private var deferredPeripherals: [UUID: (peripheral: CBPeripheral, next: Date)] = [:]
+    /// deferredPeripherals の解除時刻にスキャンをやり直すタスク（同時に 1 つだけ）
+    private var rediscoveryTask: Task<Void, Never>?
 
     // 共通（トークン単位の重複抑制）
     private var lastSavedAtByToken: [String: Date] = [:]
 
     // Peripheral 側
     private var readServedAtByCentral: [UUID: Date] = [:]
+    /// long read の途中で内容が変わらないよう、offset 0 の時点のペイロードを central ごとに保持する
+    private var readSnapshots: [UUID: (data: Data, at: Date)] = [:]
+    private let readSnapshotLifetime: TimeInterval = 60
 
     init(context: ModelContext, logger: EventLogger) {
         self.context = context
         self.logger = logger
-        self.sessionToken = String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(8))
+        self.sessionToken = Self.makeToken()
+        self.tokenCreatedAt = Date()
         let defaults = UserDefaults.standard
         self.isEnabled = defaults.bool(forKey: SettingsKey.passbyEnabled)
         self.cooldownMinutes = defaults.object(forKey: SettingsKey.cooldownMinutes) as? Int ?? 10
@@ -78,6 +97,10 @@ final class PassbyManager: NSObject {
         if isEnabled {
             createManagersIfNeeded()
         }
+    }
+
+    private static func makeToken() -> String {
+        String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(8))
     }
 
     // MARK: - 設定変更
@@ -106,6 +129,12 @@ final class PassbyManager: NSObject {
         discoveryOnly = value
         UserDefaults.standard.set(value, forKey: SettingsKey.discoveryOnly)
         logger.log(.lifecycle, .info, "発見のみモード \(value ? "オン" : "オフ")")
+        if value {
+            // 進行中の交換は打ち切る（広告は発見率計測のため継続する）
+            for session in Array(sessions.values) {
+                finishSession(session, success: false, reason: "discoveryOnly")
+            }
+        }
     }
 
     /// 登録曲が変わったときに呼ぶ（Peripheral 側は read のたびに最新を返すので特別な処理は不要）
@@ -117,14 +146,17 @@ final class PassbyManager: NSObject {
 
     func appDidBecomeActive() {
         logger.log(.lifecycle, .info, "前面に復帰")
-        if isEnabled { restartScan() }
+        if isEnabled {
+            restartScan()
+            purgeExpiredDeferred()
+        }
     }
 
     func appDidEnterBackground() {
         logger.log(.lifecycle, .info, "バックグラウンドへ")
     }
 
-    /// 手動でスキャン・広告をやり直す（デバッグ用）
+    /// 手動でスキャン・広告をやり直す（デバッグ用）。サービス追加に失敗していた場合も再試行する。
     func restartAll() {
         guard isEnabled else { return }
         logger.log(.lifecycle, .info, "手動再起動")
@@ -157,22 +189,38 @@ final class PassbyManager: NSObject {
         if isScanning { central?.stopScan() }
         isScanning = false
         logger.log(.scan, .stopped, "スキャン停止")
+        rediscoveryTask?.cancel()
+        rediscoveryTask = nil
+        deferredPeripherals.removeAll()
         for session in sessions.values {
             session.timeoutTask?.cancel()
-            central?.cancelPeripheralConnection(session.peripheral)
+            if let payload = session.receivedPayload, !session.saved {
+                session.saved = true
+                saveReceived(payload, role: .central, status: .received,
+                             peer: shortID(session.peripheral.identifier), failureReason: "ユーザーが通信をオフ")
+            }
+            requestDisconnect(session.peripheral)
         }
         sessions.removeAll()
         activeSessionCount = 0
+        // 開始要求中（isAdvertising がまだ false）の広告も止める
         stopAdvertising()
-        if serviceAdded {
+        if serviceState != .none {
             peripheralManager?.removeAllServices()
-            serviceAdded = false
+            serviceState = .none
         }
+        readSnapshots.removeAll()
     }
 
     // MARK: - 自分の曲ペイロード
 
     private func currentPayloadData() -> Data {
+        if Date().timeIntervalSince(tokenCreatedAt) > tokenLifetime {
+            let old = sessionToken
+            sessionToken = Self.makeToken()
+            tokenCreatedAt = Date()
+            logger.log(.lifecycle, .info, "セッショントークン更新 \(old) -> \(sessionToken)")
+        }
         var descriptor = FetchDescriptor<MySong>(sortBy: [SortDescriptor(\.updatedAt, order: .reverse)])
         descriptor.fetchLimit = 1
         let song = (try? context.fetch(descriptor))?.first
@@ -192,9 +240,14 @@ final class PassbyManager: NSObject {
 
     private var cooldownInterval: TimeInterval { TimeInterval(cooldownMinutes * 60) }
 
+    /// 同一トークンの二重保存を防ぐ窓。クールダウン 0 分でも、同時接続（Central と Peripheral の両経路）による重複は防ぐ。
+    private var tokenDedupWindow: TimeInterval {
+        max(cooldownInterval, BLEConstants.exchangeTimeoutSeconds * 2)
+    }
+
     private func isTokenInCooldown(_ token: String) -> Bool {
-        guard cooldownInterval > 0, let last = lastSavedAtByToken[token] else { return false }
-        return Date().timeIntervalSince(last) < cooldownInterval
+        guard let last = lastSavedAtByToken[token] else { return false }
+        return Date().timeIntervalSince(last) < tokenDedupWindow
     }
 
     /// 受信した曲を履歴に保存する。クールダウン中なら保存せず false を返す。
@@ -251,6 +304,36 @@ final class PassbyManager: NSObject {
         String(uuid.uuidString.prefix(8))
     }
 
+    // MARK: - Central: クールダウン明けの再発見
+
+    /// AllowDuplicates=false のスキャンでは、クールダウン中に一度捨てた相手は再通知されない。
+    /// そこで最も早い解除時刻にスキャンをやり直す。
+    /// 注意: バックグラウンドでは Task.sleep が大きく遅れる（またはアプリが停止している）可能性がある。
+    /// その場合は前面復帰時の appDidBecomeActive か、次の finishSession でのスキャン再開が先に効く。
+    private func scheduleRediscoveryIfNeeded() {
+        guard rediscoveryTask == nil, let earliest = deferredPeripherals.values.map(\.next).min() else { return }
+        let delay = max(0, earliest.timeIntervalSinceNow) + 0.5
+        logger.log(.scan, .info, String(format: "再発見を予約 %.0f秒後（背景ではタイマーが遅れる可能性あり）", delay))
+        rediscoveryTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard !Task.isCancelled, let self else { return }
+            self.rediscoveryTask = nil
+            guard self.isEnabled else { return }
+            self.restartScan()
+            self.logger.log(.scan, .started, "再発見のため再開")
+            self.purgeExpiredDeferred()
+            self.scheduleRediscoveryIfNeeded()
+        }
+    }
+
+    /// 解除時刻を過ぎた deferred エントリを捨てる（スキャン再開後に呼ぶ）
+    private func purgeExpiredDeferred() {
+        let now = Date()
+        deferredPeripherals = deferredPeripherals.filter { $0.value.next > now }
+    }
+
+    // MARK: - Central: セッション
+
     private func beginSession(with peripheral: CBPeripheral) {
         guard let central else { return }
         let session = PeripheralSession(peripheral: peripheral)
@@ -260,6 +343,13 @@ final class PassbyManager: NSObject {
         let peer = shortID(peripheral.identifier)
         logger.log(.connect, .started, "接続開始", peer: peer)
         central.connect(peripheral, options: nil)
+        armTimeout(for: session)
+    }
+
+    /// 交換タイムアウトを設定する（通常接続と復元セッションで共用）
+    private func armTimeout(for session: PeripheralSession) {
+        session.timeoutTask?.cancel()
+        let peer = shortID(session.peripheral.identifier)
         session.timeoutTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(BLEConstants.exchangeTimeoutSeconds))
             guard !Task.isCancelled, let self else { return }
@@ -268,9 +358,19 @@ final class PassbyManager: NSObject {
         }
     }
 
+    /// 切断を要求し、didDisconnect を受けるまで disconnecting に保持する
+    private func requestDisconnect(_ peripheral: CBPeripheral) {
+        guard peripheral.state != .disconnected else { return }
+        disconnecting[peripheral.identifier] = peripheral
+        central?.cancelPeripheralConnection(peripheral)
+    }
+
     /// セッションを終了する。受信済みで未保存なら保存し、切断してスキャンを再開する。
-    private func finishSession(_ session: PeripheralSession, success: Bool, reason: String?) {
+    /// 成功は「相手の曲を受信」かつ「自分の曲の write 成功」の両方を満たす場合のみ。
+    private func finishSession(_ session: PeripheralSession, success requestedSuccess: Bool, reason: String?) {
         let id = session.peripheral.identifier
+        // タイムアウトと切断などで二重に呼ばれても 1 回だけ処理する
+        guard sessions[id] === session else { return }
         let peer = shortID(id)
         session.timeoutTask?.cancel()
         session.timeoutTask = nil
@@ -282,28 +382,72 @@ final class PassbyManager: NSObject {
                          failureReason: session.wroteOK ? nil : (reason ?? "write未完了"))
         }
 
+        let success = requestedSuccess && session.receivedPayload != nil && session.wroteOK
         let elapsed = Date().timeIntervalSince(session.startedAt)
         if success {
             nextAllowedAtByPeripheral[id] = Date().addingTimeInterval(cooldownInterval)
             logger.log(.disconnect, .ok, String(format: "交換完了 %.2f秒", elapsed), peer: peer)
         } else {
             nextAllowedAtByPeripheral[id] = Date().addingTimeInterval(failureBackoff)
-            logger.log(.disconnect, .failed, String(format: "交換失敗 %.2f秒 reason=%@", elapsed, reason ?? "-"), peer: peer)
+            var why = reason
+            if why == nil {
+                if session.receivedPayload == nil { why = "read failed" } else if !session.wroteOK { why = "write failed" }
+            }
+            logger.log(.disconnect, .failed, String(format: "交換失敗 %.2f秒 reason=%@", elapsed, why ?? "-"), peer: peer)
         }
 
-        if session.peripheral.state != .disconnected {
-            central?.cancelPeripheralConnection(session.peripheral)
-        }
+        requestDisconnect(session.peripheral)
         sessions[id] = nil
         activeSessionCount = sessions.count
         restartScan()
+        purgeExpiredDeferred()
+    }
+
+    /// 復元された peripheral をセッションとして引き継ぐ（Central が poweredOn になってから呼ぶ）
+    private func resumeRestoredPeripherals() {
+        let restored = restoredPeripherals
+        restoredPeripherals.removeAll()
+        for peripheral in restored {
+            let id = peripheral.identifier
+            let peer = shortID(id)
+            guard isEnabled, !discoveryOnly, sessions[id] == nil else {
+                logger.log(.restore, .skipped, "復元 peripheral を破棄（通信オフ・発見のみ・処理中）", peer: peer)
+                requestDisconnect(peripheral)
+                continue
+            }
+            switch peripheral.state {
+            case .connected:
+                let session = PeripheralSession(peripheral: peripheral)
+                sessions[id] = session
+                activeSessionCount = sessions.count
+                peripheral.delegate = self
+                armTimeout(for: session)
+                if let service = peripheral.services?.first(where: { $0.uuid == BLEConstants.serviceUUID }) {
+                    logger.log(.restore, .info, "復元セッション再開（characteristic 探索から）", peer: peer)
+                    peripheral.discoverCharacteristics([BLEConstants.readCharacteristicUUID, BLEConstants.writeCharacteristicUUID], for: service)
+                } else {
+                    logger.log(.restore, .info, "復元セッション再開（サービス探索から）", peer: peer)
+                    peripheral.discoverServices([BLEConstants.serviceUUID])
+                }
+            case .connecting:
+                let session = PeripheralSession(peripheral: peripheral)
+                sessions[id] = session
+                activeSessionCount = sessions.count
+                peripheral.delegate = self
+                armTimeout(for: session)
+                logger.log(.restore, .info, "復元セッション再開（接続待ち）", peer: peer)
+            default:
+                logger.log(.restore, .skipped, "復元 peripheral を破棄 state=\(peripheral.state.rawValue)", peer: peer)
+            }
+        }
     }
 
     // MARK: - Peripheral: 広告
 
     private func startAdvertisingIfPossible() {
         guard isEnabled, let pm = peripheralManager, pm.state == .poweredOn else { return }
-        if !serviceAdded {
+        switch serviceState {
+        case .none:
             let readChar = CBMutableCharacteristic(
                 type: BLEConstants.readCharacteristicUUID,
                 properties: [.read],
@@ -319,8 +463,13 @@ final class PassbyManager: NSObject {
             let service = CBMutableService(type: BLEConstants.serviceUUID, primary: true)
             service.characteristics = [readChar, writeChar]
             pm.add(service)
-            serviceAdded = true
+            serviceState = .adding
             logger.log(.advertise, .info, "サービス追加")
+            return // didAdd 成功後に広告を開始する
+        case .adding:
+            return
+        case .added:
+            break
         }
         guard !isAdvertising else { return }
         pm.startAdvertising([
@@ -330,9 +479,10 @@ final class PassbyManager: NSObject {
         logger.log(.advertise, .started, "広告開始要求")
     }
 
+    /// 広告を止める。開始要求中で isAdvertising がまだ false の場合も止めるため、常に stopAdvertising を呼ぶ。
     private func stopAdvertising() {
+        peripheralManager?.stopAdvertising()
         if isAdvertising {
-            peripheralManager?.stopAdvertising()
             logger.log(.advertise, .stopped, "広告停止")
         }
         isAdvertising = false
@@ -346,9 +496,15 @@ extension PassbyManager: @preconcurrency CBCentralManagerDelegate {
         centralState = central.state
         logger.log(.lifecycle, .info, "Central state=\(central.state.label)")
         if central.state == .poweredOn {
-            startScanIfPossible()
+            resumeRestoredPeripherals()
+            restartScan()
         } else {
             isScanning = false
+            if !restoredPeripherals.isEmpty {
+                logger.log(.restore, .skipped, "Central が利用不可のため復元 peripheral \(restoredPeripherals.count) 件を破棄")
+                restoredPeripherals.removeAll()
+            }
+            disconnecting.removeAll()
         }
     }
 
@@ -356,26 +512,23 @@ extension PassbyManager: @preconcurrency CBCentralManagerDelegate {
         restoredCentralAtLaunch = true
         let peripherals = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral] ?? []
         let scanServices = dict[CBCentralManagerRestoredStateScanServicesKey] as? [CBUUID] ?? []
-        logger.log(.restore, .info, "Central 復元 peripherals=\(peripherals.count) scanServices=\(scanServices.count)")
+        logger.log(.restore, .info, "Central 復元（Bluetooth による起動）peripherals=\(peripherals.count) scanServices=\(scanServices.count)")
         if !scanServices.isEmpty { isScanning = true }
         for peripheral in peripherals {
             peripheral.delegate = self
-            let peer = shortID(peripheral.identifier)
-            logger.log(.restore, .info, "復元された peripheral state=\(peripheral.state.rawValue)", peer: peer)
-            if peripheral.state == .connected || peripheral.state == .connecting {
-                let session = PeripheralSession(peripheral: peripheral)
-                sessions[peripheral.identifier] = session
-                activeSessionCount = sessions.count
-                if peripheral.state == .connected {
-                    peripheral.discoverServices([BLEConstants.serviceUUID])
-                }
-            }
+            logger.log(.restore, .info, "復元された peripheral state=\(peripheral.state.rawValue)", peer: shortID(peripheral.identifier))
         }
+        // セッション化は poweredOn を待ってから行う
+        restoredPeripherals = peripherals
     }
 
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String: Any], rssi RSSI: NSNumber) {
         let id = peripheral.identifier
         let peer = shortID(id)
+        guard isEnabled else {
+            logger.log(.discovered, .skipped, "通信オフのため発見を無視", peer: peer)
+            return
+        }
         let overflow = (advertisementData[CBAdvertisementDataOverflowServiceUUIDsKey] as? [CBUUID])?.isEmpty == false
         logger.log(.discovered, .ok, "発見 rssi=\(RSSI) overflow=\(overflow)", peer: peer)
 
@@ -386,10 +539,17 @@ extension PassbyManager: @preconcurrency CBCentralManagerDelegate {
         if sessions[id] != nil {
             return
         }
-        if let next = nextAllowedAtByPeripheral[id], next > Date() {
-            logger.log(.cooldown, .skipped, "クールダウン中 残り\(Int(next.timeIntervalSinceNow))秒", peer: peer)
+        if disconnecting[id] != nil || peripheral.state != .disconnected {
+            logger.log(.connect, .skipped, "切断待ち state=\(peripheral.state.rawValue)", peer: peer)
             return
         }
+        if let next = nextAllowedAtByPeripheral[id], next > Date() {
+            logger.log(.cooldown, .skipped, "クールダウン中 残り\(Int(next.timeIntervalSinceNow))秒", peer: peer)
+            deferredPeripherals[id] = (peripheral, next)
+            scheduleRediscoveryIfNeeded()
+            return
+        }
+        deferredPeripherals[id] = nil
         beginSession(with: peripheral)
     }
 
@@ -397,7 +557,7 @@ extension PassbyManager: @preconcurrency CBCentralManagerDelegate {
         let peer = shortID(peripheral.identifier)
         logger.log(.connect, .ok, "接続成功", peer: peer)
         guard sessions[peripheral.identifier] != nil else {
-            central.cancelPeripheralConnection(peripheral)
+            requestDisconnect(peripheral)
             return
         }
         peripheral.discoverServices([BLEConstants.serviceUUID])
@@ -405,6 +565,7 @@ extension PassbyManager: @preconcurrency CBCentralManagerDelegate {
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
         let peer = shortID(peripheral.identifier)
+        disconnecting[peripheral.identifier] = nil
         logger.log(.connect, .failed, "接続失敗: \(error?.localizedDescription ?? "-")", peer: peer)
         if let session = sessions[peripheral.identifier] {
             finishSession(session, success: false, reason: "connect failed")
@@ -413,6 +574,7 @@ extension PassbyManager: @preconcurrency CBCentralManagerDelegate {
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         let peer = shortID(peripheral.identifier)
+        disconnecting[peripheral.identifier] = nil
         if let session = sessions[peripheral.identifier] {
             logger.log(.disconnect, error == nil ? .info : .failed, "切断: \(error?.localizedDescription ?? "正常")", peer: peer)
             finishSession(session, success: false, reason: "disconnected before completion")
@@ -498,12 +660,13 @@ extension PassbyManager: @preconcurrency CBPeripheralDelegate {
         guard let session = sessions[peripheral.identifier] else { return }
         if let error {
             logger.log(.write, .failed, "write 失敗: \(error.localizedDescription)", peer: peer)
-            finishSession(session, success: session.receivedPayload != nil, reason: "write failed")
+            finishSession(session, success: false, reason: "write failed")
             return
         }
         session.wroteOK = true
         logger.log(.write, .ok, "write 成功", peer: peer)
-        finishSession(session, success: session.receivedPayload != nil, reason: session.receivedPayload == nil ? "read failed" : nil)
+        // 受信できていなければ finishSession 側で失敗（片側のみ成功）として扱う
+        finishSession(session, success: true, reason: session.receivedPayload == nil ? "read failed" : nil)
     }
 }
 
@@ -517,7 +680,7 @@ extension PassbyManager: @preconcurrency CBPeripheralManagerDelegate {
             startAdvertisingIfPossible()
         } else {
             isAdvertising = false
-            serviceAdded = false
+            serviceState = .none
         }
     }
 
@@ -525,19 +688,26 @@ extension PassbyManager: @preconcurrency CBPeripheralManagerDelegate {
         restoredPeripheralAtLaunch = true
         let services = dict[CBPeripheralManagerRestoredStateServicesKey] as? [CBMutableService] ?? []
         let adData = dict[CBPeripheralManagerRestoredStateAdvertisementDataKey] as? [String: Any]
-        logger.log(.restore, .info, "Peripheral 復元 services=\(services.count) advertising=\(adData != nil)")
+        logger.log(.restore, .info, "Peripheral 復元（Bluetooth による起動）services=\(services.count) advertising=\(adData != nil)")
+        // 追加済みと分かっている場合のみ、poweredOn で即時広告できる
         if services.contains(where: { $0.uuid == BLEConstants.serviceUUID }) {
-            serviceAdded = true
+            serviceState = .added
         }
         if adData != nil { isAdvertising = true }
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, didAdd service: CBService, error: Error?) {
+        guard serviceState == .adding else {
+            logger.log(.advertise, .info, "サービス追加完了通知を無視（状態が変わっている）")
+            return
+        }
         if let error {
-            serviceAdded = false
-            logger.log(.advertise, .failed, "サービス追加失敗: \(error.localizedDescription)")
+            serviceState = .none
+            logger.log(.advertise, .failed, "サービス追加失敗: \(error.localizedDescription)（再起動で再試行）")
         } else {
+            serviceState = .added
             logger.log(.advertise, .ok, "サービス追加完了")
+            startAdvertisingIfPossible()
         }
     }
 
@@ -545,6 +715,10 @@ extension PassbyManager: @preconcurrency CBPeripheralManagerDelegate {
         if let error {
             isAdvertising = false
             logger.log(.advertise, .failed, "広告開始失敗: \(error.localizedDescription)")
+        } else if !isEnabled {
+            peripheral.stopAdvertising()
+            isAdvertising = false
+            logger.log(.advertise, .stopped, "通信オフのため開始直後に広告停止")
         } else {
             isAdvertising = true
             logger.log(.advertise, .ok, "広告中")
@@ -553,11 +727,36 @@ extension PassbyManager: @preconcurrency CBPeripheralManagerDelegate {
 
     func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveRead request: CBATTRequest) {
         let peer = shortID(request.central.identifier)
+        guard isEnabled else {
+            peripheral.respond(to: request, withResult: .readNotPermitted)
+            logger.log(.read, .skipped, "通信オフのため read 拒否", peer: peer)
+            return
+        }
         guard request.characteristic.uuid == BLEConstants.readCharacteristicUUID else {
             peripheral.respond(to: request, withResult: .attributeNotFound)
             return
         }
-        let data = currentPayloadData()
+        if discoveryOnly {
+            peripheral.respond(to: request, withResult: .readNotPermitted)
+            logger.log(.read, .skipped, "発見のみモードのため read 拒否", peer: peer)
+            return
+        }
+
+        let centralID = request.central.identifier
+        let now = Date()
+        let data: Data
+        if request.offset == 0 {
+            // 新しい read の開始。古いスナップショットを掃除してから取り直す
+            readSnapshots = readSnapshots.filter { now.timeIntervalSince($0.value.at) <= readSnapshotLifetime }
+            data = currentPayloadData()
+            readSnapshots[centralID] = (data, now)
+        } else if let snapshot = readSnapshots[centralID] {
+            data = snapshot.data
+        } else {
+            peripheral.respond(to: request, withResult: .invalidOffset)
+            logger.log(.read, .failed, "read 応答: スナップショットなし offset=\(request.offset)", peer: peer)
+            return
+        }
         guard request.offset <= data.count else {
             peripheral.respond(to: request, withResult: .invalidOffset)
             logger.log(.read, .failed, "read 応答: 不正なオフセット \(request.offset)", peer: peer)
@@ -565,7 +764,7 @@ extension PassbyManager: @preconcurrency CBPeripheralManagerDelegate {
         }
         request.value = data.subdata(in: request.offset..<data.count)
         peripheral.respond(to: request, withResult: .success)
-        readServedAtByCentral[request.central.identifier] = Date()
+        readServedAtByCentral[centralID] = now
         logger.log(.read, .ok, "read 応答 \(data.count)bytes offset=\(request.offset) mtu=\(request.central.maximumUpdateValueLength)", peer: peer)
     }
 
@@ -573,23 +772,37 @@ extension PassbyManager: @preconcurrency CBPeripheralManagerDelegate {
         guard let first = requests.first else { return }
         let peer = shortID(first.central.identifier)
 
-        // 分割書き込み（long write）に備えて、同じ central からの要求をオフセット順に結合する
-        let sorted = requests
-            .filter { $0.characteristic.uuid == BLEConstants.writeCharacteristicUUID }
-            .sorted { $0.offset < $1.offset }
-        guard !sorted.isEmpty else {
-            peripheral.respond(to: first, withResult: .attributeNotFound)
+        // 要求が複数でも応答は first に 1 回だけ返す
+        guard isEnabled else {
+            peripheral.respond(to: first, withResult: .writeNotPermitted)
+            logger.log(.write, .skipped, "通信オフのため write 拒否", peer: peer)
             return
         }
+        guard requests.allSatisfy({ $0.characteristic.uuid == BLEConstants.writeCharacteristicUUID }) else {
+            peripheral.respond(to: first, withResult: .attributeNotFound)
+            logger.log(.write, .failed, "write 受信: 対象外の characteristic を含む", peer: peer)
+            return
+        }
+        if discoveryOnly {
+            peripheral.respond(to: first, withResult: .writeNotPermitted)
+            logger.log(.write, .skipped, "発見のみモードのため write 拒否", peer: peer)
+            return
+        }
+
+        // 分割書き込み（long write）: offset 0 から隙間なく連続していることを確認して結合する
+        let sorted = requests.sorted { $0.offset < $1.offset }
         var buffer = Data()
         for req in sorted {
-            if let value = req.value {
-                if req.offset <= buffer.count {
-                    buffer.removeSubrange(req.offset..<buffer.count)
-                    buffer.append(value)
-                } else {
-                    buffer.append(value)
-                }
+            guard req.offset == buffer.count else {
+                peripheral.respond(to: first, withResult: .invalidOffset)
+                logger.log(.write, .failed, "write 受信: 不連続なオフセット \(req.offset)（期待値 \(buffer.count)）", peer: peer)
+                return
+            }
+            buffer.append(req.value ?? Data())
+            guard buffer.count <= BLEConstants.maxPayloadBytes else {
+                peripheral.respond(to: first, withResult: .invalidAttributeValueLength)
+                logger.log(.write, .failed, "write 受信: \(BLEConstants.maxPayloadBytes)bytes 超過", peer: peer)
+                return
             }
         }
 

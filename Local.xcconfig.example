@@ -1,0 +1,3 @@
+// このファイルを Local.xcconfig にコピーし、自分の Team ID（10 桁）を入れる。
+// Local.xcconfig は git 管理外。
+DEVELOPMENT_TEAM = XXXXXXXXXX

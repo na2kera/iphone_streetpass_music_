@@ -46,6 +46,40 @@ final class EventLogger {
         oslog.info("[\(state, privacy: .public)] \(type.rawValue, privacy: .public)/\(outcome.rawValue, privacy: .public) \(details, privacy: .public) peer=\(peer ?? "-", privacy: .public)")
     }
 
+    /// ログの保持期間（日）と件数上限
+    static let retentionDays = 7
+    static let maxEvents = 5000
+
+    /// 起動時に呼ぶ。7 日より古いログを削除し、さらに 5000 件を超える分を古い順に削除する。
+    func pruneIfNeeded() {
+        let cutoff = Date().addingTimeInterval(-TimeInterval(Self.retentionDays) * 24 * 60 * 60)
+        var removedByAge = 0
+        var removedByCount = 0
+        do {
+            let oldDescriptor = FetchDescriptor<DebugEvent>(predicate: #Predicate { $0.timestamp < cutoff })
+            removedByAge = try context.fetchCount(oldDescriptor)
+            if removedByAge > 0 {
+                try context.delete(model: DebugEvent.self, where: #Predicate { $0.timestamp < cutoff })
+            }
+            let total = try context.fetchCount(FetchDescriptor<DebugEvent>())
+            if total > Self.maxEvents {
+                var overflow = FetchDescriptor<DebugEvent>(sortBy: [SortDescriptor(\.timestamp, order: .forward)])
+                overflow.fetchLimit = total - Self.maxEvents
+                for event in try context.fetch(overflow) {
+                    context.delete(event)
+                }
+                removedByCount = total - Self.maxEvents
+            }
+            try context.save()
+        } catch {
+            log(.error, .failed, "ログ整理失敗: \(error.localizedDescription)")
+            return
+        }
+        if removedByAge > 0 || removedByCount > 0 {
+            log(.lifecycle, .info, "ログ整理 期限切れ\(removedByAge)件 上限超過\(removedByCount)件を削除")
+        }
+    }
+
     func clearAll() {
         try? context.delete(model: DebugEvent.self)
         try? context.save()

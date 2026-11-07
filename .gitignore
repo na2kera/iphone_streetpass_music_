@@ -14,3 +14,6 @@ build/
 
 # Export / logs
 *.jsonl
+
+# Signing（個人の Team ID）
+Local.xcconfig

@@ -1,45 +1,54 @@
 import SwiftData
 import SwiftUI
 
-/// App init で生成し、AppDelegate からも参照できるようにする
-@MainActor
-enum AppServices {
-    static var manager: PassbyManager?
-}
-
 @main
 struct StreetPassMusicApp: App {
-    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @Environment(\.scenePhase) private var scenePhase
 
-    private let container: ModelContainer
-    private let manager: PassbyManager
+    /// 生成に失敗した場合は nil。その場合はエラー画面を表示し、BLE は開始しない。
+    private let container: ModelContainer?
+    private let manager: PassbyManager?
+    private let containerError: String?
 
     init() {
         let schema = Schema([MySong.self, PassbyEvent.self, DebugEvent.self])
         let config = ModelConfiguration(schema: schema)
         do {
-            container = try ModelContainer(for: schema, configurations: [config])
+            let container = try ModelContainer(for: schema, configurations: [config])
+            let context = container.mainContext
+            let logger = EventLogger(context: context)
+            // 古いログを先に整理してから BLE を開始する
+            logger.pruneIfNeeded()
+            self.container = container
+            // State Restoration のため、通信オン中は起動直後に Manager を生成する
+            // （復元による起動かどうかは willRestoreState のログで判別する）
+            self.manager = PassbyManager(context: context, logger: logger)
+            self.containerError = nil
         } catch {
-            fatalError("ModelContainer の生成に失敗: \(error)")
+            self.container = nil
+            self.manager = nil
+            self.containerError = String(describing: error)
         }
-        let context = container.mainContext
-        let logger = EventLogger(context: context)
-        // State Restoration のため、通信オン中は起動直後に Manager を生成する
-        manager = PassbyManager(context: context, logger: logger)
-        AppServices.manager = manager
     }
 
     var body: some Scene {
         WindowGroup {
-            RootView()
-                .environment(manager)
+            if let container, let manager {
+                RootView()
+                    .environment(manager)
+                    .modelContainer(container)
+            } else {
+                ContentUnavailableView(
+                    "データベースを開けませんでした",
+                    systemImage: "exclamationmark.triangle",
+                    description: Text(containerError ?? "不明なエラー")
+                )
+            }
         }
-        .modelContainer(container)
         .onChange(of: scenePhase) { _, phase in
             switch phase {
-            case .active: manager.appDidBecomeActive()
-            case .background: manager.appDidEnterBackground()
+            case .active: manager?.appDidBecomeActive()
+            case .background: manager?.appDidEnterBackground()
             default: break
             }
         }
