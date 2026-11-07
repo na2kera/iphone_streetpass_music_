@@ -60,6 +60,8 @@ final class EventLogger {
             removedByAge = try context.fetchCount(oldDescriptor)
             if removedByAge > 0 {
                 try context.delete(model: DebugEvent.self, where: #Predicate { $0.timestamp < cutoff })
+                // 削除を確定させてから数える（未保存のままだと件数に含まれ、上限超過分を消しすぎる）
+                try context.save()
             }
             let total = try context.fetchCount(FetchDescriptor<DebugEvent>())
             if total > Self.maxEvents {
