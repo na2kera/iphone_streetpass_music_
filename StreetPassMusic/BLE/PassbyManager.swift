@@ -134,6 +134,9 @@ final class PassbyManager: NSObject {
             for session in Array(sessions.values) {
                 finishSession(session, success: false, reason: "discoveryOnly")
             }
+        } else if isEnabled {
+            // AllowDuplicates=false のため、発見のみ中に見た相手はスキャンをやり直さないと再報告されない
+            restartScan()
         }
     }
 
