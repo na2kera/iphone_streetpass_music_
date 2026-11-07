@@ -67,6 +67,8 @@ final class PassbyManager: NSObject {
     private var nextAllowedAtByPeripheral: [UUID: Date] = [:]
     /// 失敗時の再試行待ち時間
     private let failureBackoff: TimeInterval = 30
+    /// 成功後に同じ相手へ再接続するまでの最短間隔（クールダウン 0 分でも即時再接続を繰り返さない）
+    private let minReconnectInterval: TimeInterval = 5
     /// State Restoration で渡された peripheral。poweredOn になってから処理する。
     private var restoredPeripherals: [CBPeripheral] = []
     /// 切断要求を出し、didDisconnect をまだ受けていない peripheral と、その要求時刻
@@ -129,6 +131,13 @@ final class PassbyManager: NSObject {
         cooldownMinutes = max(0, min(30, minutes))
         UserDefaults.standard.set(cooldownMinutes, forKey: SettingsKey.cooldownMinutes)
         logger.log(.lifecycle, .info, "クールダウン変更 \(cooldownMinutes)分")
+        // 旧設定で決めた相手ごとの待ち時間と再発見予約を捨て、新しい設定で発見し直す
+        nextAllowedAtByPeripheral.removeAll()
+        deferredPeripherals.removeAll()
+        rediscoveryTask?.cancel()
+        rediscoveryTask = nil
+        rediscoveryFireAt = nil
+        if isEnabled { restartScan() }
     }
 
     func setDiscoveryOnly(_ value: Bool) {
@@ -202,6 +211,7 @@ final class PassbyManager: NSObject {
         rediscoveryTask = nil
         rediscoveryFireAt = nil
         deferredPeripherals.removeAll()
+        nextAllowedAtByPeripheral.removeAll()
         for session in sessions.values {
             session.timeoutTask?.cancel()
             if let payload = session.receivedPayload, !session.saved {
@@ -225,16 +235,20 @@ final class PassbyManager: NSObject {
 
     // MARK: - 自分の曲ペイロード
 
-    private func currentPayloadData() -> Data {
-        // 交換の途中（Central のセッション中、または直近に read 応答した相手がいる間）はトークンを変えない
+    /// 寿命を過ぎたトークンを作り直す。
+    /// 交換の途中（Central のセッション中、または直近に read 応答した相手がいる間）はトークンを変えない。
+    private func rotateTokenIfNeeded() {
         let now = Date()
         let servingRecently = readServedAtByCentral.values.contains { now.timeIntervalSince($0) < tokenDedupWindow }
-        if now.timeIntervalSince(tokenCreatedAt) > tokenLifetime, sessions.isEmpty, !servingRecently {
-            let old = sessionToken
-            sessionToken = Self.makeToken()
-            tokenCreatedAt = Date()
-            logger.log(.lifecycle, .info, "セッショントークン更新 \(old) -> \(sessionToken)")
-        }
+        guard now.timeIntervalSince(tokenCreatedAt) > tokenLifetime, sessions.isEmpty, !servingRecently else { return }
+        let old = sessionToken
+        sessionToken = Self.makeToken()
+        tokenCreatedAt = now
+        logger.log(.lifecycle, .info, "セッショントークン更新 \(old) -> \(sessionToken)")
+    }
+
+    private func currentPayloadData() -> Data {
+        rotateTokenIfNeeded()
         var descriptor = FetchDescriptor<MySong>(sortBy: [SortDescriptor(\.updatedAt, order: .reverse)])
         descriptor.fetchLimit = 1
         let song = (try? context.fetch(descriptor))?.first
@@ -305,13 +319,16 @@ final class PassbyManager: NSObject {
         logger.log(.scan, .started, "スキャン開始 service=\(BLEConstants.serviceUUID.uuidString.prefix(8))")
     }
 
-    private func restartScan() {
-        guard let central, central.state == .poweredOn else { return }
+    /// スキャンをやり直す。実際にスキャンを再開できたら true を返す。
+    @discardableResult
+    private func restartScan() -> Bool {
+        guard let central, central.state == .poweredOn else { return false }
         if isScanning {
             central.stopScan()
             isScanning = false
         }
         startScanIfPossible()
+        return isScanning
     }
 
     private func shortID(_ uuid: UUID) -> String {
@@ -343,8 +360,9 @@ final class PassbyManager: NSObject {
             self.rediscoveryTask = nil
             self.rediscoveryFireAt = nil
             guard self.isEnabled else { return }
-            self.restartScan()
-            self.logger.log(.scan, .started, "再発見のため再開")
+            if self.restartScan() {
+                self.logger.log(.scan, .started, "再発見のため再開")
+            }
             self.purgeExpiredDeferred()
             self.scheduleRediscoveryIfNeeded()
         }
@@ -360,6 +378,8 @@ final class PassbyManager: NSObject {
 
     private func beginSession(with peripheral: CBPeripheral) {
         guard let central else { return }
+        // セッション登録前（sessions が空になりうる時点）にトークン更新の機会を作る
+        rotateTokenIfNeeded()
         let session = PeripheralSession(peripheral: peripheral)
         sessions[peripheral.identifier] = session
         activeSessionCount = sessions.count
@@ -409,7 +429,7 @@ final class PassbyManager: NSObject {
         let success = requestedSuccess && session.receivedPayload != nil && session.wroteOK
         let elapsed = Date().timeIntervalSince(session.startedAt)
         if success {
-            nextAllowedAtByPeripheral[id] = Date().addingTimeInterval(cooldownInterval)
+            nextAllowedAtByPeripheral[id] = Date().addingTimeInterval(max(cooldownInterval, minReconnectInterval))
             logger.log(.disconnect, .ok, String(format: "交換完了 %.2f秒", elapsed), peer: peer)
         } else {
             // 自分側の都合（Bluetooth 停止・発見のみモード）で打ち切った場合はバックオフしない
@@ -432,6 +452,10 @@ final class PassbyManager: NSObject {
         if disconnecting[id] == nil {
             restartScan()
             purgeExpiredDeferred()
+        } else {
+            // 保険: didDisconnect / didFailToConnect が届かない場合に備え、切断待ちの上限時刻に再発見を予約する
+            deferredPeripherals[id] = (session.peripheral, Date().addingTimeInterval(disconnectWaitLimit))
+            scheduleRediscoveryIfNeeded()
         }
     }
 
@@ -542,6 +566,10 @@ extension PassbyManager: @preconcurrency CBCentralManagerDelegate {
             }
             if !restoredPeripherals.isEmpty {
                 logger.log(.restore, .skipped, "Central が利用不可のため復元 peripheral \(restoredPeripherals.count) 件を破棄")
+                // 接続が残っていれば切る（復帰後に「切断待ち」のまま再接続できなくなるのを防ぐ）
+                for peripheral in restoredPeripherals {
+                    central.cancelPeripheralConnection(peripheral)
+                }
                 restoredPeripherals.removeAll()
             }
             disconnecting.removeAll()
@@ -585,8 +613,12 @@ extension PassbyManager: @preconcurrency CBCentralManagerDelegate {
         }
         if disconnecting[id] != nil || peripheral.state != .disconnected {
             logger.log(.connect, .skipped, "切断待ち state=\(peripheral.state.rawValue)", peer: peer)
-            // 保険: didDisconnect でのスキャン再開が効かなかった場合に備え、1 秒後の再発見を予約する
-            deferredPeripherals[id] = (peripheral, Date().addingTimeInterval(1))
+            // 期限切れで解除した後も接続が残っている場合は、切断要求を出し直す（無期限の反復を防ぐ）
+            if disconnecting[id] == nil, peripheral.state != .disconnected {
+                requestDisconnect(peripheral)
+            }
+            // 保険: didDisconnect でのスキャン再開が効かなかった場合に備え、切断待ちの上限時刻に再発見を予約する
+            deferredPeripherals[id] = (peripheral, Date().addingTimeInterval(disconnectWaitLimit))
             scheduleRediscoveryIfNeeded()
             return
         }
@@ -613,6 +645,8 @@ extension PassbyManager: @preconcurrency CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
         let peer = shortID(peripheral.identifier)
         disconnecting[peripheral.identifier] = nil
+        // 切断待ちの保険として登録した再発見予約は不要になる（以下でスキャンを再開する）
+        deferredPeripherals[peripheral.identifier] = nil
         logger.log(.connect, .failed, "接続失敗: \(error?.localizedDescription ?? "-")", peer: peer)
         if let session = sessions[peripheral.identifier] {
             // disconnecting を外した後なので finishSession 内でスキャンが再開される
@@ -627,6 +661,8 @@ extension PassbyManager: @preconcurrency CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         let peer = shortID(peripheral.identifier)
         disconnecting[peripheral.identifier] = nil
+        // 切断待ちの保険として登録した再発見予約は不要になる（以下でスキャンを再開する）
+        deferredPeripherals[peripheral.identifier] = nil
         if let session = sessions[peripheral.identifier] {
             logger.log(.disconnect, error == nil ? .info : .failed, "切断: \(error?.localizedDescription ?? "正常")", peer: peer)
             finishSession(session, success: false, reason: "disconnected before completion")

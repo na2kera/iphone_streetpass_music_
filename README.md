@@ -22,13 +22,18 @@ xcodegen generate
 open StreetPassMusic.xcodeproj
 ```
 
-1. Team を設定する（Personal Team 可。7 日で期限切れになるので再インストールする）。`Local.xcconfig.example` の `DEVELOPMENT_TEAM` は空なので、次のどちらか。
-   - Xcode で Team を選ぶ場合: `DEVELOPMENT_TEAM` は空のままにして、Signing & Capabilities で Team を選ぶ。`.xcodeproj` に書かれるので、`xcodegen generate` するたびに選び直しになる。
-   - CLI（`xcodebuild`）でビルドする場合: `Local.xcconfig` の `DEVELOPMENT_TEAM` に自分の Team ID（10 桁）を書く。`xcodegen generate` し直しても保持される。`Local.xcconfig` は git 管理外。
+1. Team を設定する（Personal Team 可。7 日で期限切れになるので再インストールする）。`Local.xcconfig.example` の `DEVELOPMENT_TEAM` はコメントアウトされていてキーを定義しないので、次のどちらか。
+   - Xcode で Team を選ぶ場合: `Local.xcconfig` はコメントアウトのままにして、Signing & Capabilities で Team を選ぶ。`.xcodeproj` に書かれるので、`xcodegen generate` するたびに選び直しになる。
+   - CLI（`xcodebuild`）でビルドする場合: `Local.xcconfig` の `// DEVELOPMENT_TEAM = XXXXXXXXXX` の行のコメントを外し、自分の Team ID（10 桁）を書く。`xcodegen generate` し直しても保持される。`Local.xcconfig` は git 管理外。
 2. iPhone を接続し、実機を選んで Run。**シミュレータでは BLE が動かない**。
-3. 初回起動時に Bluetooth の許可ダイアログが出る。
+3. 初めて「すれ違い通信」をオンにしたときに Bluetooth の許可ダイアログが出る。
 
 `.xcodeproj` は git 管理していない。`project.yml` を変更したら `xcodegen generate` を再実行する。
+
+環境の注意:
+
+- Xcode 26.6 は iOS 26.5 SDK のみ同梱。iOS 27.0.1 の実機が「not supported」と出る場合は Xcode 27 が必要。
+- アプリアイコンは未設定（PoC のため）。
 
 ## 使い方
 
@@ -72,6 +77,7 @@ Central 側の交換は「相手の曲の read 成功」と「自分の曲の wr
 | 2026-11-08 | 仕様書で未確定だった項目を決定 | Swift 5 言語モード、SwiftData、XcodeGen、JSON 512B、ACK 省略、クールダウン 10 分、Background Modes と State Restoration を初期から導入 | 前面・背景を同じビルドで比較できる | 実機 2 台で T-01 から順に実施 |
 | 2026-11-08 | レビュー第1回（`docs/reviews/2026-11-08-round1.md`、19 項目） | 通信オフ後のコールバック遮断、サービス追加完了後の広告、クールダウン明けの再発見、復元セッションのタイムアウト、セッション終了の冪等化と切断待ち、成功判定を read かつ write に厳密化、トークン重複抑制の最小窓、オフ時の未保存分の保存、発見のみモードで GATT 応答も拒否、long read/write の検証、トークンの 60 分ローテーション、AppDelegate 削除（復元の判別は willRestoreState のログ）、512 バイトの実行時保証と入力上限、DB を開けないときのエラー画面、ログの保持期間と件数上限、曲登録画面の初回のみ読み込み、Team ID を Local.xcconfig へ | 状態遷移の取りこぼしと二重処理が減る。ログの「交換完了」は read と write の両方成功のみになる | シミュレータ・実機向けビルド成功。BLE の挙動は実機 2 台で未検証 |
 | 2026-11-08 | レビュー第2回（`docs/reviews/2026-11-08-round2.md`、10 項目） | 切断待ち中はスキャン再開を didDisconnect に任せる（再発見の取りこぼし防止）、再発見予約をより早い期限で取り直す、didAdd を追加中サービスの同一インスタンスで照合、Bluetooth オフ→オンでサービスを二重登録しない、切断待ちを 5 秒で期限切れ、Bluetooth 停止時にセッションを畳む（自分都合の打ち切りはバックオフなし）、交換中はトークンを更新しない、ログ件数上限の過剰削除を修正、`Local.xcconfig.example` を空の Team に | 切断直後や Bluetooth のオンオフ後も相手に再接続できる。ログに `connect/info 切断待ちを期限切れで解除` が増える | シミュレータ・実機向けビルド成功。BLE の挙動は実機 2 台で未検証 |
+| 2026-11-08 | レビュー第3回（`docs/reviews/2026-11-08-round3.md`、11 項目） | 切断コールバックが来ない場合も切断待ちの上限時刻に再発見を予約、期限切れ後も接続が残る相手へ切断要求を出し直す、Bluetooth 停止時に破棄する復元 peripheral の接続も切る、成功後の再接続は最短 5 秒空ける、クールダウン変更・通信オフで相手ごとの待ち時間と再発見予約を初期化、トークン更新をセッション開始時にも判定、`scan/started 再発見のため再開` は実際に再開したときだけ記録、`Local.xcconfig.example` の Team 行をコメントアウト、README・テスト手順の補足 | 切断待ちのまま再接続できない状態が続きにくくなる。クールダウン 0 分でも同じ相手への即時再接続ループが起きない | シミュレータ・実機向けビルド成功。BLE の挙動は実機 2 台で未検証 |
 
 ## 実機テスト結果
 

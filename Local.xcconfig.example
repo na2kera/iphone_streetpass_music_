@@ -1,4 +1,4 @@
 // このファイルを Local.xcconfig にコピーする。Local.xcconfig は git 管理外。
-// Xcode の Signing & Capabilities で Team を選ぶ場合は空のまま。
-// CLI（xcodebuild）でビルドする場合は 10 桁の Team ID を入れる。
-DEVELOPMENT_TEAM =
+// Xcode の Signing & Capabilities で Team を選ぶ場合はコメントアウトのまま。
+// CLI（xcodebuild）でビルドする場合は次の行のコメントを外し、10 桁の Team ID を入れる。
+// DEVELOPMENT_TEAM = XXXXXXXXXX
