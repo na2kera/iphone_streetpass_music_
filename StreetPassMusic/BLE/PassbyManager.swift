@@ -742,8 +742,14 @@ extension PassbyManager: @preconcurrency CBPeripheralManagerDelegate {
             serviceState = .none
             pendingService = nil
         } else {
-            // poweredOff: サービス登録は保持される。広告は一時停止扱い
+            // poweredOff: 登録済みサービスは保持される。広告は一時停止扱い
             isAdvertising = false
+            // 追加要求中に電源断すると didAdd が届かないことがあるため、未完了の追加は破棄して復帰後にやり直す
+            if serviceState == .adding {
+                serviceState = .none
+                pendingService = nil
+                logger.log(.advertise, .info, "サービス追加中に Bluetooth オフ。復帰後に再追加する")
+            }
         }
     }
 
