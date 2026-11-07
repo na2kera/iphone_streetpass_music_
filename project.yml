@@ -1,0 +1,41 @@
+name: StreetPassMusic
+options:
+  bundleIdPrefix: com.keranatsuki
+  deploymentTarget:
+    iOS: "26.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    SWIFT_STRICT_CONCURRENCY: minimal
+    CODE_SIGN_STYLE: Automatic
+    # Personal Team を使う場合は Xcode の Signing & Capabilities で一度 Team を選ぶ
+    DEVELOPMENT_TEAM: ""
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+targets:
+  StreetPassMusic:
+    type: application
+    platform: iOS
+    sources:
+      - path: StreetPassMusic
+    info:
+      path: StreetPassMusic/Info.plist
+      properties:
+        CFBundleDisplayName: StreetPass Music
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        UIBackgroundModes:
+          - bluetooth-central
+          - bluetooth-peripheral
+        NSBluetoothAlwaysUsageDescription: 近くのアプリ利用者と曲を交換するためにBluetoothを利用します。
+        ITSAppUsesNonExemptEncryption: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.keranatsuki.streetpassmusic
+        TARGETED_DEVICE_FAMILY: "1"
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES

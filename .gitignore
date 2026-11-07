@@ -1,0 +1,16 @@
+# Xcode
+*.xcodeproj/
+xcuserdata/
+*.xcuserstate
+DerivedData/
+build/
+.build/
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# macOS
+.DS_Store
+
+# Export / logs
+*.jsonl
